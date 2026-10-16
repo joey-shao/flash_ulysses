@@ -12,9 +12,7 @@ with peer access and CUDA multicast support. All participating GPUs must be
 visible to every worker; launch one process per GPU with `torchrun`.
 
 ```bash
-git clone --recurse-submodules <your-repository-url>
-cd flash_ulysses
-python -m pip install 'setuptools>=68' wheel ninja
+git submodule update --init --recursive
 bash install.sh
 ```
 

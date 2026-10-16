@@ -1,7 +1,6 @@
 // Native ThunderKittens, pinned by the thirdparty/ThunderKittens submodule.
 #include "kittens.cuh"
 #include "pyutils/torchutils.cuh"
-#include "ops.h"
 
 namespace flash_ulysses {
 using namespace kittens;
@@ -142,7 +141,7 @@ __device__ void epilogue(const globals<N>& G, shared_state& sm,
 template<int N>
 __device__ void kernel(const globals<N>& G) {
     extern __shared__ __align__(1024) int storage[];
-    shared_allocator allocator(storage);
+    tma_swizzle_allocator allocator(storage);
 
     auto& sm = allocator.allocate<shared_state>();
 
