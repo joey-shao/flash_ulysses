@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68", "wheel", "torch>=2.8", "ninja"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "flash_ulysses"
+version = "0.1.0"
+description = "ThunderKittens persistent QKV projection and Ulysses exchange for single-node NVLink GPUs"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {file = "LICENSE"}
+dependencies = ["torch>=2.8"]
+
+[tool.setuptools]
+license-files = ["LICENSE", "thirdparty/ThunderKittens/LICENSE"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["flash_ulysses*"]
+namespaces = false
+
+[tool.setuptools.package-data]
+flash_ulysses = ["csrc/*.cu", "csrc/*.h", "csrc/impl/*.cu", "csrc/impl/*.cuh"]
+

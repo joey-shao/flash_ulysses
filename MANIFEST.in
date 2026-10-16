@@ -1,0 +1,6 @@
+include LICENSE README.md DESIGN.md
+include setup.py install.sh pyproject.toml .gitmodules
+recursive-include flash_ulysses/csrc *.cu *.cuh *.h
+recursive-include tests *.py
+include thirdparty/ThunderKittens/LICENSE
+recursive-include thirdparty/ThunderKittens/include *.cuh *.h *.hpp *.cpp
