@@ -122,8 +122,11 @@ def main(args):
     from flash_ulysses import FlashUlyssesContext
     from torch_base import TorchReference, make_parameters
 
-    _, _, control_group = init_distributed_environment()
+    rank, world_size, control_group = init_distributed_environment()
+
     context = FlashUlyssesContext(
+        rank=rank,
+        world_size=world_size,
         max_local_tokens=max(args.local_tokens) + 128,
         control_group=control_group,
         hidden_size=args.hidden_size,

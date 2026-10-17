@@ -8,9 +8,8 @@ It uses upstream ThunderKittens `gl`, `pgl`, WGMMA, TMA, semaphores and launch A
 ## Work and rank layout
 
 A task computes **128 token rows × one 128-element head**. The reduction advances
-by 64 hidden elements. A persistent grid of 132 CTAs follows the TK H100 GEMM-RS
-configuration; tasks advance by `gridDim.x`. This is a tuning choice, not an
-assumption that every supported GPU has exactly 132 SMs.
+by 64 hidden elements. The persistent grid uses
+`min(num_tasks, device_SM_count)` CTAs.
 
 ```text
 head_count = q_heads + 2 * kv_heads       # heads in this base-TP projection

@@ -3,11 +3,10 @@
 Fused BF16 QKV projection, Q/K RMSNorm, NeoX RoPE and Ulysses exchange for
 single-node Hopper GPUs, built with [ThunderKittens](https://github.com/HazyResearch/ThunderKittens).
 Each CTA overlaps WGMMA and peer TMA stores using separate warps on the same SM.
-The kernel returns separate Q, K and V tensors.
 
 ## Build
 
-Requires Linux, CUDA Toolkit 12.8+, CUDA-enabled PyTorch 2.8+, and 2–8 H100/H200 GPUs
+Requires Linux, CUDA Toolkit 12.8+, CUDA-enabled PyTorch 2.8+, and 2–8 Hopper GPUs
 with peer access and CUDA multicast support. All participating GPUs must be
 visible to every worker; launch one process per GPU with `torchrun`.
 
@@ -17,9 +16,7 @@ bash install.sh
 ```
 
 `install.sh` initializes the pinned ThunderKittens submodule and builds an
-editable installation using the existing PyTorch/CUDA environment. Set
-`CUDA_HOME` and `MAX_JOBS` as needed. Rebuild after CUDA source changes.
-No GPU is required to compile; GPU execution is required to validate the kernel.
+editable installation using the existing PyTorch/CUDA environment.
 
 ## Use
 
@@ -31,6 +28,8 @@ All ranks use the same dimensions and active input length.
 from flash_ulysses import FlashUlyssesContext
 
 context = FlashUlyssesContext(
+    rank=rank,
+    world_size=world_size,
     max_local_tokens=4096,
     hidden_size=4096,
     num_heads=32,

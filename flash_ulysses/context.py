@@ -9,6 +9,8 @@ from . import _C
 class FlashUlyssesContext:
     """Construct, call and close collectively on one Hopper node.
 
+    rank and world_size describe the participating physical GPUs on this node.
+    control_group must cover those same participants for lifecycle barriers.
     Calls use the current CUDA stream. Results alias Q/K/V until the next call
     or close. Before reuse, every physical rank must finish consuming its
     previous output and complete the previous TK barrier. See DESIGN.md.
@@ -17,6 +19,8 @@ class FlashUlyssesContext:
     def __init__(
         self,
         *,
+        rank,
+        world_size,
         max_local_tokens,
         hidden_size=4096,
         num_heads=32,
@@ -25,13 +29,13 @@ class FlashUlyssesContext:
         sp_size=2,
         control_group=None,
     ):
-        self.rank, self.world_size = dist.get_rank(), dist.get_world_size()
-        self.device = torch.device("cuda", torch.cuda.current_device())
+        self.rank, self.world_size = rank, world_size
         self.control_group = control_group
         self.hidden_size = hidden_size
         self.num_heads, self.num_kv_heads = num_heads, num_kv_heads
         self.head_dim, self.sp_size = head_dim, sp_size
         self.max_local_tokens = max_local_tokens
+        self.device = torch.device("cuda", torch.cuda.current_device())
 
         if not 2 <= sp_size <= self.world_size <= 8 or self.world_size % sp_size:
             raise ValueError("SP must divide a single-node world of 2 to 8 GPUs")
