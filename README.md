@@ -90,15 +90,12 @@ torchrun --standalone --nproc-per-node=8 tests/benchmark.py \
   --sp-size 4 --check-only --local-tokens 1 63 64 65 127 128 129
 ```
 
-The SGLang adapter calls real `Qwen3Attention.forward_prepare_native` and
-`exchange_qkv`, with synthetic weights and no model download. It requires the
-Ulysses branch APIs in `srt.distributed.ulysses_parallel`,
-`srt.layers.sp.sp_strategy` and `srt.runtime_context`; an ordinary SGLang release
-may not include them. Install that checkout's dependencies first. There is no
-fallback that silently replaces SGLang with the PyTorch baseline.
+The SGLang base follows Qwen3's eager CUDA path directly: BF16 `F.linear`
+(the unquantized torch GEMM backend), Q/K/V split, `fused_inplace_qknorm`,
+NeoX `apply_rope_with_cos_sin_cache_inplace`, then QKV exchange.
 
-When both baselines are selected, all three implementations use the exact weights
-and RoPE cache exported from SGLang. Checks compare every Q/K/V row, including
+All implementations use the same synthetic weights and FP32 RoPE cache, with
+BF16 norm weights exported to TK as FP32. Checks compare every Q/K/V row, including
 padding, and verify that inactive receive capacity stays untouched. The default
 absolute/relative tolerances are `0.03125`/`0.02`; maximum absolute error and RMS
 error are reported across ranks.
