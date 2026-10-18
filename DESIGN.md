@@ -45,7 +45,7 @@ reduction dimension.
 Every CTA has 384 threads, with the same roles on every SM:
 
 ```text
-WG0 / WG1: WGMMA → BF16 shared output → Q/K RMSNorm + RoPE
+WG0 / WG1: WGMMA → Q/K RMSNorm + RoPE in registers → BF16 shared output
 WG2:
   warp0, lane0: TMA load X and QKV weight
   warp1, lane0: TMA store Q/K/V directly to the destination GPU
@@ -63,7 +63,7 @@ Actual register use/spills must be checked in the `ptxas -v` build output.
 | --- | --- | --- |
 | `inputs_arrived[3]` | TMA input loads | One producer arrival + expected bytes |
 | `inputs_finished[3]` | WGMMA reading the slot | Eight consumer warps |
-| `outputs_arrived[2]` | Both consumer epilogues | Two consumer warpgroups |
+| `outputs_arrived[2]` | Both consumers finish writing the final shared output | Two consumer warpgroups |
 | `outputs_finished[2]` | Peer TMA stores | One store thread |
 
 One per-thread `phasebits` tracks all rings: lower bits for arrived semaphores,
@@ -72,24 +72,35 @@ slots are available. `input_stage` and `output_stage` advance independently and
 carry across tasks.
 
 `__syncthreads()` publishes semaphore initialization before roles diverge.
-A named barrier within each consumer WG completes shared output stores before
-its epilogue. Every consumer executes the generic-to-async proxy fence; an
-eight-warp barrier joins both consumers before handing the slot to the store
-warp. A full `tma::store_async_wait()` completes peer writes before releasing the
-slot. These are producer/consumer dependencies, not optional input validation.
+`rmsnorm_and_rope` modifies the accumulator in registers before waiting for an
+output slot. After the slot becomes available, consumers write the final result to shared
+memory once. Each consumer WG synchronizes its own writes before its leader
+signals `outputs_arrived`. The store thread waits for both arrivals.
+A full `tma::store_async_wait()` completes peer writes before releasing the slot.
 
 ## Numerics and token tails
 
-WGMMA accumulates in FP32 and rounds the projection to BF16. Q and K then use
-FP32 RMSNorm, round its result to BF16, apply FP32 NeoX RoPE, and round to BF16
-again. V keeps the BF16 projection. The intermediate rounding boundaries match
-the separate operators in the reference path. Different reduction orders can
-still produce small differences, so comparisons use explicit tolerances.
+WGMMA accumulates in FP32. Q and K keep that precision through RMSNorm and
+NeoX RoPE, with no intermediate BF16 conversions. The final shared store
+rounds the RoPE result to BF16. V skips the register epilogue and rounds its
+projection in that store.
 
-Q/K epilogues load and store rows with TK `warp::load` / `warp::store`. Each warp
-owns rows `warp_id, warp_id+4, ...` in its 64-row tile. Rows past `L` skip the
-epilogue, including the position lookup. Out-of-bounds TMA activation loads fill
-with zero.
+The SGLang and PyTorch baselines materialize BF16 outputs after projection and
+RMSNorm. The fused path intentionally omits those intermediate rounding steps,
+so its Q/K results can differ even with identical reduction orders. Existing
+baseline comparisons measure agreement with those BF16 operator pipelines;
+they do not establish accuracy against an FP32-intermediate reference.
+
+Each consumer warp owns 16 consecutive rows in the WGMMA register layout.
+Four adjacent lanes share a row; each lane holds fragments of two rows eight
+rows apart. RMSNorm uses TK's `warp::mul` to form an FP32 squared tile and
+`warp::row_sum` to reduce each row. The squared tile's scope ends after the
+reduction. TK vector and row/column maps apply the normalization scale and gamma.
+`apply_neox_rope` isolates the WGMMA layout indexing for RoPE. NeoX partners
+are 64 columns (four 16-column base tiles) apart in the same thread, so RoPE
+needs no cross-lane exchange. Padded rows may participate in the register norm
+but skip RoPE and the position lookup. Out-of-bounds TMA activation loads fill
+with zero; out-of-bounds output rows are discarded by TMA.
 
 Each peer output is described as **`[S, 1, L, heads_per_gpu*128]`** using the native
 `parallel_tensor_to_pgl` shape overload. The underlying allocation is a contiguous

@@ -29,6 +29,8 @@ struct kernel_config {
     using A_tile = st_bf<ROWS_PER_WG, RED_BLOCK>;
     using B_tile = st_bf<RED_BLOCK, COL_BLOCK>;
     using C_tile = st_bf<ROWS_PER_WG, COL_BLOCK>;
+    using accumulator_tile = rt_fl<ROWS_PER_WG / WARPGROUP_WARPS, COL_BLOCK>;
+
     using A_gl = gl<bf16, 1, 1, -1, -1, A_tile>;
     using B_gl = gl<bf16, 1, 1, -1, -1, B_tile>;
     using C_gl = gl<bf16, -1, 1, -1, -1, C_tile>;  // [source SP rank, 1, L, head columns]
@@ -79,68 +81,78 @@ struct kernel_args {
     __host__ dim3 grid() const { return dim3(num_blocks, 1, 1); }
 };
 
-// Called by the 8 consumer warps after FP32 -> BF16 shared-store rounding.
+// Apply NeoX RoPE directly to the WGMMA register layout.
 template<int N>
-__device__ void epilogue(const kernel_args<N>& G, kernel_config::shared_state& sm,
-                         int row_idx, int col_idx, int output_stage) {
-    if (col_idx >= G.q_heads + G.kv_heads) return;
+__device__ void apply_neox_rope(const kernel_args<N>& G,
+                              kernel_config::accumulator_tile& accumulator,
+                              int row_idx) {
+    using RT = kernel_config::accumulator_tile;
+    constexpr int half_dim = kernel_config::HEAD_DIM / 2;
+    // NeoX partners are four base tiles apart in the same lane. Each float2
+    // holds adjacent columns, so rotation needs no inter-lane communication.
+    const int lane = warp::laneid();
+    const int first_row = row_idx * kernel_config::ROW_BLOCK +
+        warpgroup::groupid() * kernel_config::ROWS_PER_WG +
+        warpgroup::warpid() * RT::rows + lane / 4;
 
-    const bool is_q = col_idx < G.q_heads;
-    const int warpgroup_id = warpgroup::groupid();
-    const float epsilon = is_q ? G.q_epsilon : G.k_epsilon;
-    auto& output = sm.outputs[output_stage].C[warpgroup_id];
-
-    rv_fl<kernel_config::HEAD_DIM> gamma;
-    warp::load(gamma, is_q ? G.q_gamma : G.k_gamma, {0});
-
-    for (int row = warpgroup::warpid(); row < kernel_config::ROWS_PER_WG; row += WARPGROUP_WARPS) {
-        const int m = row_idx * kernel_config::ROW_BLOCK + warpgroup_id * kernel_config::ROWS_PER_WG + row;
+    #pragma unroll
+    for (int row_half = 0; row_half < 2; ++row_half) {
+        const int m = first_row + row_half * 8;
+        // The four lanes sharing a row take the same branch. Padded rows
+        // must never read positions, even though their TMA stores are clipped.
         if (m >= G.A.rows()) continue;
-
-        rv_bf<kernel_config::HEAD_DIM> rounded;
-        rv_fl<kernel_config::HEAD_DIM> value, squared;
-
-        warp::load(rounded, output, {row, 0});
-        warp::copy(value, rounded);
-        warp::mul(squared, value, value);
-        const float scale = rsqrtf(warp::sum(squared) / kernel_config::HEAD_DIM + epsilon);
-        warp::mul(value, value, scale);
-        warp::mul(value, value, gamma);
-        warp::copy(rounded, value);
-        warp::copy(value, rounded);
-
-        const int64_t pos = G.positions[{m}];
-        rv_fl<kernel_config::HEAD_DIM / 2> lo, hi, cosine, sine, lo_cos, hi_sin;
-
-        // NeoX pairs the two halves of the head. In naive RV layout each
-        // partner is in the same lane, two registers away.
-        #pragma unroll
-        for (int i = 0; i < decltype(lo)::outer_dim; ++i) {
-            lo[i][0] = value[i][0];
-            hi[i][0] = value[i + decltype(lo)::outer_dim][0];
-        }
-        warp::load(cosine, G.rope, {0, 0, static_cast<int>(pos), 0});
-        warp::load(sine, G.rope, {0, 0, static_cast<int>(pos), 1});
-        warp::mul(lo_cos, lo, cosine);
-        warp::mul(hi_sin, hi, sine);
-        warp::sub(lo_cos, lo_cos, hi_sin);
-        warp::mul(hi, hi, cosine);
-        warp::mul(lo, lo, sine);
-        warp::add(hi, hi, lo);
+        const int pos = static_cast<int>(G.positions[{m}]);
 
         #pragma unroll
-        for (int i = 0; i < decltype(lo)::outer_dim; ++i) {
-            value[i][0] = lo_cos[i][0];
-            value[i + decltype(lo)::outer_dim][0] = hi[i][0];
+        for (int j = 0; j < RT::width / 2; ++j) {
+            #pragma unroll
+            for (int col_half = 0; col_half < 2; ++col_half) {
+                const int k = row_half + col_half * 2;
+                const int col = j * RT::tile_size_col + col_half * 8 + (lane % 4) * 2;
+                const float2 lo = accumulator.tiles[0][j].data[k];
+                const float2 hi = accumulator.tiles[0][j + RT::width / 2].data[k];
+                const float2 cosine = {G.rope[{0, 0, pos, col}], G.rope[{0, 0, pos, col + 1}]};
+                const float2 sine = {G.rope[{0, 0, pos, col + half_dim}], G.rope[{0, 0, pos, col + half_dim + 1}]};
+                accumulator.tiles[0][j].data[k] = {
+                    lo.x * cosine.x - hi.x * sine.x,
+                    lo.y * cosine.y - hi.y * sine.y};
+                accumulator.tiles[0][j + RT::width / 2].data[k] = {
+                    hi.x * cosine.x + lo.x * sine.x,
+                    hi.y * cosine.y + lo.y * sine.y};
+            }
         }
-        warp::copy(rounded, value);
-
-        warp::store(output, rounded, {row, 0});
     }
 }
 
+// Keep GEMM, RMSNorm and RoPE results in FP32 registers until the BF16 shared store.
+template<int N>
+__device__ void rmsnorm_and_rope(const kernel_args<N>& G,
+                               kernel_config::accumulator_tile& accumulator,
+                               int row_idx, int col_idx) {
+    using RT = kernel_config::accumulator_tile;
+    const bool is_q = col_idx < G.q_heads;
+    const float epsilon = is_q ? G.q_epsilon : G.k_epsilon;
+
+    RT::row_vec gamma;
+    RT::col_vec scale;
+
+    {
+        RT squared;
+        warp::mul(squared, accumulator, accumulator);
+        warp::row_sum(scale, squared);
+    }
+    warp::apply(scale, scale, [epsilon](int, float sum) {
+        return rsqrtf(sum / RT::cols + epsilon);
+    });
+    warp::load(gamma, is_q ? G.q_gamma : G.k_gamma, {0});
+    warp::mul_row(accumulator, accumulator, scale);
+    warp::mul_col(accumulator, accumulator, gamma);
+
+    apply_neox_rope(G, accumulator, row_idx);
+}
+
 // All CTAs have the same roles, following TK parallel/gemm_rs/gemm_rs_h100.cu:
-// WG0/WG1: WGMMA + epilogue; WG2 warp0: TMA load; WG2 warp1: peer TMA store.
+// WG0/WG1: WGMMA + RMSNorm/RoPE; WG2 warp0: TMA load; WG2 warp1: peer TMA store.
 template<int N>
 __device__ void kernel(const kernel_args<N>& G) {
     extern __shared__ __align__(1024) int storage[];
@@ -229,7 +241,7 @@ __device__ void kernel(const kernel_args<N>& G) {
             const int row_idx = task_id / col_blocks;
             const int col_idx = task_id % col_blocks;
 
-            rt_fl<kernel_config::ROWS_PER_WG / WARPGROUP_WARPS, kernel_config::COL_BLOCK> accumulator;
+            kernel_config::accumulator_tile accumulator;
             warp::zero(accumulator);
 
             for (int red_idx = 0; red_idx < num_iters; ++red_idx) {
@@ -241,19 +253,13 @@ __device__ void kernel(const kernel_args<N>& G) {
                 input_stage = (input_stage + 1) % kernel_config::INPUT_STAGES;
             }
 
-            // Accumulation can overlap an earlier send. Do not overwrite its
-            // shared slot until the store warp has finished reading it.
+            if (col_idx < G.q_heads + G.kv_heads)
+                rmsnorm_and_rope(G, accumulator, row_idx, col_idx);
+
             wait(sm.outputs_finished[output_stage], get_phasebit<1>(phasebits, kernel_config::INPUT_STAGES + output_stage));
             update_phasebit<1>(phasebits, kernel_config::INPUT_STAGES + output_stage);
             warpgroup::store(sm.outputs[output_stage].C[warpgroup_id], accumulator);
-            warpgroup::arrive_and_wait(barrier<WARPGROUP_WARPS>(warpgroup_id + 1));
-
-            epilogue(G, sm, row_idx, col_idx, output_stage);
-
-            // Every shared writer crosses the generic -> async proxy fence.
-            // The consumer-only barrier joins both WG epilogues before handoff.
-            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-            group<kernel_config::CONSUMER_WARPS>::arrive_and_wait(barrier<kernel_config::CONSUMER_WARPS>(3));
+            warpgroup::sync(warpgroup_id + 1);
             warpgroup::arrive(sm.outputs_arrived[output_stage]);
             output_stage = (output_stage + 1) % kernel_config::OUTPUT_STAGES;
         }
